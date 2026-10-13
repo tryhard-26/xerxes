@@ -38,7 +38,16 @@ x /             # Go to root
 
 If multiple matches are found with similar scores, an interactive selector (FZF or custom TUI) will allow you to select the desired directory.
 
-### Aliases (Nicknames)
+### Extra Roots
+
+Only your home directory is indexed by default. To index other drives or mount points, list them in `XERXES_ROOTS` (`:`-separated), then restart the daemon and reindex:
+
+```bash
+export XERXES_ROOTS="/mnt/data:/media/usb"   # fish: set -Ux XERXES_ROOTS "/mnt/data:/media/usb"
+pkill _xerxesd && _xerxes reindex
+```
+
+### Aliases
 
 You can create permanent nicknames for directories to bypass fuzzy search entirely:
 

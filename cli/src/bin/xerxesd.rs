@@ -30,6 +30,22 @@ fn get_socket_path() -> Result<PathBuf> {
     Ok(run_dir.join("xerxesd.sock"))
 }
 
+/// $HOME plus any absolute paths in the colon-separated XERXES_ROOTS env var.
+fn index_roots() -> Vec<PathBuf> {
+    let extra = std::env::var_os("XERXES_ROOTS").unwrap_or_default();
+    UserDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .into_iter()
+        .chain(std::env::split_paths(&extra).filter(|p| p.is_absolute()))
+        .collect()
+}
+
+fn index_all(db: &XerxesDb) -> Result<()> {
+    index_roots()
+        .iter()
+        .try_for_each(|root| index::scan_and_index(root, db))
+}
+
 fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
     let mut buffer = Vec::new();
     stream.read_to_end(&mut buffer)?;
@@ -83,14 +99,10 @@ fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
             Ok(_) => Response::Status("Smart learning memory cleared".to_string()),
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Reindex => {
-            let user_dirs = UserDirs::new().context("Could not find user directories")?;
-            let home = user_dirs.home_dir().to_path_buf();
-            match index::scan_and_index(&home, &db) {
-                Ok(_) => Response::Status("Reindex complete".to_string()),
-                Err(e) => Response::Error(e.to_string()),
-            }
-        }
+        Request::Reindex => match index_all(&db) {
+            Ok(_) => Response::Status("Reindex complete".to_string()),
+            Err(e) => Response::Error(e.to_string()),
+        },
         Request::Stats => match db.get_stats() {
             Ok((dirs, segments)) => Response::Status(format!(
                 "Indexed: {} directories, {} unique segments",
@@ -121,16 +133,11 @@ fn start_watcher(db: Arc<XerxesDb>) {
             }
         };
 
-        let user_dirs = match UserDirs::new() {
-            Some(d) => d,
-            None => return,
-        };
-        let home = user_dirs.home_dir().to_path_buf();
-
-        info!("Starting live filesystem watcher on {:?}", home);
-        if let Err(e) = watcher.watch(&home, RecursiveMode::Recursive) {
-            error!("Failed to watch home dir: {}", e);
-            return;
+        for root in index_roots() {
+            info!("Starting live filesystem watcher on {:?}", root);
+            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+                error!("Failed to watch {:?}: {}", root, e);
+            }
         }
 
         for res in rx {
@@ -175,9 +182,7 @@ fn main() -> Result<()> {
         info!("Database is empty, starting initial reindex...");
         let db_clone = Arc::clone(&db);
         thread::spawn(move || {
-            let user_dirs = UserDirs::new().expect("Could not find user directories");
-            let home = user_dirs.home_dir().to_path_buf();
-            if let Err(e) = index::scan_and_index(&home, &db_clone) {
+            if let Err(e) = index_all(&db_clone) {
                 error!("Initial reindex failed: {}", e);
             } else {
                 info!("Initial reindex complete.");

@@ -5,7 +5,7 @@ First off, thanks for taking the time to contribute!
 ## How to Contribute
 
 1. **Fork the Repository**: Create your own fork of the project.
-2. **Clone the Fork**: `git clone https://github.com/tryh4rd-26/xerxes.git`
+2. **Clone the Fork**: `git clone https://github.com/tryhard-26/xerxes.git`
 3. **Create a Branch**: `git checkout -b feature/my-new-feature`
 4. **Make Changes**: Implement your feature or fix.
 5. **Test Your Changes**: Ensure everything works as expected.

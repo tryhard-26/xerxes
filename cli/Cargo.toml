@@ -1,12 +1,12 @@
 [package]
 name = "xerxes"
-version = "0.2.9"
+version = "0.2.11"
 edition = "2021"
 authors = ["tryhard"]
 description = "High-performance filesystem navigation engine"
 license = "MIT"
 readme = "../README.md"
-repository = "https://github.com/tryh4rd-26/xerxes"
+repository = "https://github.com/tryhard-26/xerxes"
 
 [[bin]]
 name = "_xerxes"

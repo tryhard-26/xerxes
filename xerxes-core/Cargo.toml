@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["tryhard"]
 description = "Core database and search engine for Xerxes"
 license = "MIT"
-repository = "https://github.com/tryh4rd-26/xerxes"
+repository = "https://github.com/tryhard-26/xerxes"
 
 [dependencies]
 redb = { workspace = true }

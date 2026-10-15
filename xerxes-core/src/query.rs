@@ -74,7 +74,10 @@ pub fn search(db: &XerxesDb, query: &str) -> Result<Vec<SearchResult>> {
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
-    results.truncate(20);
-
-    Ok(results)
+    // Hide missing dirs (deleted, or on an unplugged drive) but keep them indexed.
+    Ok(results
+        .into_iter()
+        .filter(|r| r.path.is_dir())
+        .take(20)
+        .collect())
 }

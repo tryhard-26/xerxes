@@ -71,5 +71,12 @@ pub fn search(db: &XerxesDb, query: &str) -> Result<Vec<SearchResult>> {
         })
         // The index can lag behind deletions the watcher missed.
         .filter(|r| Path::new(&r.path).is_dir())
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    // Hide missing dirs (deleted, or on an unplugged drive) but keep them indexed.
+    Ok(results
+        .into_iter()
+        .filter(|r| r.path.is_dir())
+        .take(20)
         .collect())
 }

@@ -1,10 +1,10 @@
 [package]
 name = "xerxes-core"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 authors = ["tryhard"]
 description = "Core database and search engine for Xerxes"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/tryhard-26/xerxes"
 
 [dependencies]
@@ -12,7 +12,5 @@ redb = { workspace = true }
 jwalk = { workspace = true }
 nucleo-matcher = { workspace = true }
 serde = { workspace = true }
-directories = { workspace = true }
-toml = { workspace = true }
 anyhow = { workspace = true }
 bincode = { workspace = true }

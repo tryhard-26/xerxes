@@ -1,10 +1,11 @@
 use anyhow::Result;
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const SEGMENT_ID_TO_STR: TableDefinition<u32, &str> = TableDefinition::new("segment_id_to_str");
 const SEGMENT_STR_TO_ID: TableDefinition<&str, u32> = TableDefinition::new("segment_str_to_id");
@@ -28,273 +29,345 @@ pub struct DirMetadata {
     pub access_count: u32,
 }
 
+impl DirMetadata {
+    /// Frecency with a 7-day half-life applied up to `now`.
+    pub fn frecency_at(&self, now: u64) -> f32 {
+        if self.last_access == 0 {
+            return self.frecency;
+        }
+        let elapsed_days = now.saturating_sub(self.last_access) as f32 / 86400.0;
+        self.frecency * 0.5f32.powf(elapsed_days / 7.0)
+    }
+}
+
+/// A directory as the query loop wants it: resolved once, not per query.
+pub struct CachedDir {
+    pub path: String,
+    /// Lowercased last path segment.
+    pub name: String,
+    pub hash: u64,
+}
+
+#[derive(Default)]
+struct Segments {
+    by_str: HashMap<String, u32>,
+    by_id: HashMap<u32, String>,
+    next: u32,
+}
+
+impl Segments {
+    fn resolve(&self, ids: &[u32]) -> PathBuf {
+        ids.iter().filter_map(|id| self.by_id.get(id)).collect()
+    }
+}
+
+// ponytail: DefaultHasher output isn't guaranteed stable across Rust releases; switch to a
+// fixed hash (e.g. FNV) plus a one-time rehash migration if a toolchain bump ever orphans rows.
+pub fn path_hash(path: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct XerxesDb {
     db: Database,
-    segment_cache: Mutex<HashMap<String, u32>>,
-    id_to_segment_cache: Mutex<HashMap<u32, String>>,
-    next_segment_id: Mutex<u32>,
-    dir_cache: Mutex<Option<std::sync::Arc<Vec<(DirectoryEntry, DirMetadata)>>>>,
+    segments: Mutex<Segments>,
+    /// Only directories that have ever been visited; absent means default.
+    meta: Mutex<HashMap<u64, DirMetadata>>,
+    dir_cache: Mutex<Option<Arc<Vec<CachedDir>>>>,
+    cache_gen: AtomicU64,
 }
 
 impl XerxesDb {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = Database::create(path)?;
-        let next_segment_id;
-        let mut segment_cache = HashMap::new();
-        let mut id_to_segment_cache = HashMap::new();
+        let mut segments = Segments::default();
+        let mut meta = HashMap::new();
 
+        let write_txn = db.begin_write()?;
         {
-            let write_txn = db.begin_write()?;
-            {
-                write_txn.open_table(SEGMENT_ID_TO_STR)?;
-                write_txn.open_table(SEGMENT_STR_TO_ID)?;
-                write_txn.open_table(DIRECTORIES)?;
-                write_txn.open_table(METADATA)?;
-                write_txn.open_table(ALIASES)?;
-                write_txn.open_table(SELECTION_MEMORY)?;
-                let state_table = write_txn.open_table(STATE)?;
-                next_segment_id = state_table
-                    .get("next_segment_id")?
-                    .map(|v| v.value())
-                    .unwrap_or(0);
+            write_txn.open_table(SEGMENT_STR_TO_ID)?;
+            write_txn.open_table(DIRECTORIES)?;
+            write_txn.open_table(ALIASES)?;
+            write_txn.open_table(SELECTION_MEMORY)?;
+            segments.next = write_txn
+                .open_table(STATE)?
+                .get("next_segment_id")?
+                .map(|v| v.value())
+                .unwrap_or(0);
 
-                if next_segment_id > 0 {
-                    let id_table = write_txn.open_table(SEGMENT_ID_TO_STR)?;
-                    for item in id_table.iter()? {
-                        let (k, v) = item?;
-                        let key = k.value();
-                        let val = v.value().to_string();
-                        segment_cache.insert(val.clone(), key);
-                        id_to_segment_cache.insert(key, val);
+            for item in write_txn.open_table(SEGMENT_ID_TO_STR)?.iter()? {
+                let (k, v) = item?;
+                segments.by_str.insert(v.value().to_string(), k.value());
+                segments.by_id.insert(k.value(), v.value().to_string());
+            }
+
+            for item in write_txn.open_table(METADATA)?.iter()? {
+                let (k, v) = item?;
+                if let Ok(m) = bincode::deserialize::<DirMetadata>(v.value()) {
+                    if m.access_count > 0 {
+                        meta.insert(k.value(), m);
                     }
                 }
             }
-            write_txn.commit()?;
         }
+        write_txn.commit()?;
 
         Ok(Self {
             db,
-            segment_cache: Mutex::new(segment_cache),
-            id_to_segment_cache: Mutex::new(id_to_segment_cache),
-            next_segment_id: Mutex::new(next_segment_id),
+            segments: Mutex::new(segments),
+            meta: Mutex::new(meta),
             dir_cache: Mutex::new(None),
+            cache_gen: AtomicU64::new(0),
         })
     }
 
     pub fn invalidate_cache(&self) {
-        *self.dir_cache.lock().unwrap() = None;
+        let mut cache = self.dir_cache.lock().unwrap();
+        self.cache_gen.fetch_add(1, Ordering::SeqCst);
+        *cache = None;
     }
 
-    pub fn begin_write(&self) -> Result<WriteTransaction> {
-        Ok(self.db.begin_write()?)
-    }
-
-    pub fn intern_segment_txn(&self, txn: &WriteTransaction, segment: &str) -> Result<u32> {
+    /// Inserts paths not already indexed, in one transaction. Returns how many were new.
+    pub fn add_directories<P: AsRef<Path>>(&self, paths: &[P]) -> Result<usize> {
+        let txn = self.db.begin_write()?;
+        let mut segs = self.segments.lock().unwrap();
+        // New segments live here until commit so a failed txn can't leave dangling ids in memory.
+        let mut pending: HashMap<String, u32> = HashMap::new();
+        let mut next = segs.next;
+        let mut added = 0;
         {
-            let cache = self.segment_cache.lock().unwrap();
-            if let Some(&id) = cache.get(segment) {
-                return Ok(id);
+            let mut id_to_str = txn.open_table(SEGMENT_ID_TO_STR)?;
+            let mut str_to_id = txn.open_table(SEGMENT_STR_TO_ID)?;
+            let mut dirs = txn.open_table(DIRECTORIES)?;
+
+            for path in paths {
+                let path = path.as_ref();
+                let hash = path_hash(path);
+                if dirs.get(hash)?.is_some() {
+                    continue;
+                }
+
+                let mut ids = Vec::new();
+                for component in path.components() {
+                    let s = component.as_os_str().to_string_lossy();
+                    let id = match segs.by_str.get(s.as_ref()).or(pending.get(s.as_ref())) {
+                        Some(&id) => id,
+                        None => {
+                            let id = next;
+                            next += 1;
+                            id_to_str.insert(id, s.as_ref())?;
+                            str_to_id.insert(s.as_ref(), id)?;
+                            pending.insert(s.into_owned(), id);
+                            id
+                        }
+                    };
+                    ids.push(id);
+                }
+
+                let entry = DirectoryEntry {
+                    depth: ids.len() as u16,
+                    segments: ids,
+                    hash,
+                };
+                dirs.insert(hash, bincode::serialize(&entry)?.as_slice())?;
+                added += 1;
+            }
+
+            if next != segs.next {
+                txn.open_table(STATE)?.insert("next_segment_id", next)?;
             }
         }
 
-        let mut id_to_str = txn.open_table(SEGMENT_ID_TO_STR)?;
-        let mut str_to_id = txn.open_table(SEGMENT_STR_TO_ID)?;
-        let mut state_table = txn.open_table(STATE)?;
-
-        let mut next_id_guard = self.next_segment_id.lock().unwrap();
-        let current_id = *next_id_guard;
-
-        id_to_str.insert(current_id, segment)?;
-        str_to_id.insert(segment, current_id)?;
-
-        *next_id_guard += 1;
-        state_table.insert("next_segment_id", *next_id_guard)?;
-
-        self.segment_cache
-            .lock()
-            .unwrap()
-            .insert(segment.to_string(), current_id);
-        self.id_to_segment_cache
-            .lock()
-            .unwrap()
-            .insert(current_id, segment.to_string());
-
-        Ok(current_id)
-    }
-
-    pub fn intern_path_txn(&self, txn: &WriteTransaction, path: &Path) -> Result<Vec<u32>> {
-        let mut segments = Vec::new();
-        for component in path.components() {
-            let comp_str = component.as_os_str().to_string_lossy();
-            let id = self.intern_segment_txn(txn, &comp_str)?;
-            segments.push(id);
+        if added == 0 {
+            txn.abort()?;
+            return Ok(0);
         }
-        Ok(segments)
-    }
+        txn.commit()?;
 
-    pub fn add_directory_txn(&self, txn: &WriteTransaction, path: &Path) -> Result<()> {
+        segs.next = next;
+        for (s, id) in pending {
+            segs.by_id.insert(id, s.clone());
+            segs.by_str.insert(s, id);
+        }
+        drop(segs);
         self.invalidate_cache();
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let segments = self.intern_path_txn(txn, path)?;
-        let entry = DirectoryEntry {
-            depth: segments.len() as u16,
-            segments,
-            hash,
-        };
-
-        let mut dirs = txn.open_table(DIRECTORIES)?;
-        let mut meta = txn.open_table(METADATA)?;
-
-        let entry_bytes = bincode::serialize(&entry)?;
-        dirs.insert(hash, entry_bytes.as_slice())?;
-
-        if meta.get(hash)?.is_none() {
-            let default_meta = DirMetadata::default();
-            let meta_bytes = bincode::serialize(&default_meta)?;
-            meta.insert(hash, meta_bytes.as_slice())?;
-        }
-
-        Ok(())
+        Ok(added)
     }
 
-    pub fn add_directory(&self, path: &Path) -> Result<()> {
-        let write_txn = self.begin_write()?;
-        self.add_directory_txn(&write_txn, path)?;
-        write_txn.commit()?;
-        Ok(())
+    pub fn contains(&self, path: &Path) -> Result<bool> {
+        let read_txn = self.db.begin_read()?;
+        Ok(read_txn
+            .open_table(DIRECTORIES)?
+            .get(path_hash(path))?
+            .is_some())
     }
 
-    pub fn resolve_path(&self, segments: &[u32]) -> PathBuf {
-        let mut path = PathBuf::new();
-        let cache = self.id_to_segment_cache.lock().unwrap();
-        for id in segments {
-            if let Some(s) = cache.get(id) {
-                path.push(s);
+    /// Removes indexed paths. Returns how many were actually indexed.
+    pub fn remove_directories<P: AsRef<Path>>(&self, paths: &[P]) -> Result<usize> {
+        let txn = self.db.begin_write()?;
+        let mut removed = 0;
+        {
+            let mut dirs = txn.open_table(DIRECTORIES)?;
+            for path in paths {
+                if dirs.remove(path_hash(path.as_ref()))?.is_some() {
+                    removed += 1;
+                }
             }
         }
-        path
+        if removed == 0 {
+            txn.abort()?;
+            return Ok(0);
+        }
+        txn.commit()?;
+        self.invalidate_cache();
+        Ok(removed)
     }
 
-    pub fn get_all_directories(
+    /// Drops every indexed directory for which `keep(hash, path)` returns false.
+    /// `path` resolves lazily so callers that decide by hash skip the work.
+    pub fn retain_directories(
         &self,
-    ) -> Result<std::sync::Arc<Vec<(DirectoryEntry, DirMetadata)>>> {
+        mut keep: impl FnMut(u64, &dyn Fn() -> PathBuf) -> bool,
+    ) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let segs = self.segments.lock().unwrap();
+            txn.open_table(DIRECTORIES)?.retain(|hash, v| {
+                let path = || {
+                    bincode::deserialize::<DirectoryEntry>(v)
+                        .map(|e| segs.resolve(&e.segments))
+                        .unwrap_or_default()
+                };
+                keep(hash, &path)
+            })?;
+        }
+        txn.commit()?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    pub fn get_all_directories(&self) -> Result<Arc<Vec<CachedDir>>> {
         if let Some(cache) = self.dir_cache.lock().unwrap().as_ref() {
-            return Ok(std::sync::Arc::clone(cache));
+            return Ok(Arc::clone(cache));
         }
 
+        let gen = self.cache_gen.load(Ordering::SeqCst);
         let read_txn = self.db.begin_read()?;
         let dirs = read_txn.open_table(DIRECTORIES)?;
-        let meta = read_txn.open_table(METADATA)?;
 
-        let mut entries = Vec::new();
-        for item in dirs.iter()? {
-            let (k, v) = item?;
-            let hash = k.value();
-            let entry: DirectoryEntry = bincode::deserialize(v.value())?;
-
-            let metadata = if let Some(m_v) = meta.get(hash)? {
-                bincode::deserialize(m_v.value()).unwrap_or_default()
-            } else {
-                DirMetadata::default()
-            };
-
-            entries.push((entry, metadata));
+        let mut entries = Vec::with_capacity(dirs.len()? as usize);
+        {
+            let segs = self.segments.lock().unwrap();
+            for item in dirs.iter()? {
+                let (k, v) = item?;
+                let entry: DirectoryEntry = bincode::deserialize(v.value())?;
+                let path = segs.resolve(&entry.segments);
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                entries.push(CachedDir {
+                    path: path.to_string_lossy().into_owned(),
+                    name,
+                    hash: k.value(),
+                });
+            }
         }
 
-        let arc_entries = std::sync::Arc::new(entries);
-        *self.dir_cache.lock().unwrap() = Some(std::sync::Arc::clone(&arc_entries));
-        Ok(arc_entries)
+        let entries = Arc::new(entries);
+        let mut cache = self.dir_cache.lock().unwrap();
+        // Skip storing if a write landed while we were reading; it would be stale.
+        if self.cache_gen.load(Ordering::SeqCst) == gen {
+            *cache = Some(Arc::clone(&entries));
+        }
+        Ok(entries)
+    }
+
+    /// Decayed frecency for every visited directory, keyed by path hash.
+    pub fn frecencies(&self) -> HashMap<u64, f32> {
+        let now = now_secs();
+        self.meta
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&h, m)| (h, m.frecency_at(now)))
+            .collect()
     }
 
     pub fn update_dir_access(&self, path: &Path) -> Result<()> {
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = path_hash(path);
+        let now = now_secs();
+        let mut meta = self.meta.lock().unwrap();
+        let m = meta.entry(hash).or_default();
+        m.frecency = m.frecency_at(now) + 1.0;
+        m.last_access = now;
+        m.access_count += 1;
+        let meta_bytes = bincode::serialize(m)?;
 
-        let write_txn = self.begin_write()?;
-        {
-            let mut meta = write_txn.open_table(METADATA)?;
-            let mut metadata: DirMetadata = if let Some(v) = meta.get(hash)? {
-                bincode::deserialize(v.value()).unwrap_or_default()
-            } else {
-                DirMetadata::default()
-            };
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            if metadata.last_access > 0 {
-                let elapsed_days = (now.saturating_sub(metadata.last_access)) as f32 / 86400.0;
-                metadata.frecency *= 0.5f32.powf(elapsed_days / 7.0);
-            }
-            metadata.frecency += 1.0;
-            metadata.last_access = now;
-            metadata.access_count += 1;
-
-            let meta_bytes = bincode::serialize(&metadata)?;
-            meta.insert(hash, meta_bytes.as_slice())?;
-        }
+        let write_txn = self.db.begin_write()?;
+        write_txn
+            .open_table(METADATA)?
+            .insert(hash, meta_bytes.as_slice())?;
         write_txn.commit()?;
         Ok(())
     }
 
     pub fn get_stats(&self) -> Result<(u64, usize)> {
         let read_txn = self.db.begin_read()?;
-        let dirs = read_txn.open_table(DIRECTORIES)?;
-        let dir_count = dirs.len()?;
-        let segment_count = self.segment_cache.lock().unwrap().len();
+        let dir_count = read_txn.open_table(DIRECTORIES)?.len()?;
+        let segment_count = self.segments.lock().unwrap().by_id.len();
         Ok((dir_count, segment_count))
     }
 
     pub fn is_empty(&self) -> Result<bool> {
         let read_txn = self.db.begin_read()?;
-        let dirs = read_txn.open_table(DIRECTORIES)?;
-        Ok(dirs.len()? == 0)
+        Ok(read_txn.open_table(DIRECTORIES)?.is_empty()?)
+    }
+
+    fn put(&self, table: TableDefinition<&str, &str>, key: &str, value: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        write_txn.open_table(table)?.insert(key, value)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn get(&self, table: TableDefinition<&str, &str>, key: &str) -> Result<Option<PathBuf>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(table)?;
+        let value = table.get(key)?.map(|v| PathBuf::from(v.value()));
+        Ok(value)
+    }
+
+    fn clear(&self, table: TableDefinition<&str, &str>) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        write_txn.open_table(table)?.retain(|_, _| false)?;
+        write_txn.commit()?;
+        Ok(())
     }
 
     pub fn add_alias(&self, nickname: &str, path: &Path) -> Result<()> {
-        let path_str = path.to_string_lossy();
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(ALIASES)?;
-            table.insert(nickname, path_str.as_ref())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.put(ALIASES, nickname, &path.to_string_lossy())
     }
 
     pub fn get_alias(&self, nickname: &str) -> Result<Option<PathBuf>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ALIASES)?;
-        if let Some(v) = table.get(nickname)? {
-            return Ok(Some(PathBuf::from(v.value())));
-        }
-        Ok(None)
+        self.get(ALIASES, nickname)
     }
 
     pub fn record_selection(&self, query: &str, path: &Path) -> Result<()> {
-        let path_str = path.to_string_lossy();
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SELECTION_MEMORY)?;
-            table.insert(query, path_str.as_ref())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.put(SELECTION_MEMORY, query, &path.to_string_lossy())
     }
 
     pub fn get_selection_memory(&self, query: &str) -> Result<Option<PathBuf>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SELECTION_MEMORY)?;
-        if let Some(v) = table.get(query)? {
-            return Ok(Some(PathBuf::from(v.value())));
-        }
-        Ok(None)
+        self.get(SELECTION_MEMORY, query)
     }
 
     pub fn list_aliases(&self) -> Result<Vec<(String, String)>> {
@@ -308,45 +381,60 @@ impl XerxesDb {
         Ok(results)
     }
 
-    pub fn remove_alias(&self, nickname: &str) -> Result<()> {
+    /// Returns whether the alias existed.
+    pub fn remove_alias(&self, nickname: &str) -> Result<bool> {
         let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(ALIASES)?;
-            table.remove(nickname)?;
-        }
+        let existed = write_txn.open_table(ALIASES)?.remove(nickname)?.is_some();
         write_txn.commit()?;
-        Ok(())
+        Ok(existed)
     }
 
     pub fn clear_aliases(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(ALIASES)?;
-            let keys: Vec<String> = table
-                .iter()?
-                .map(|i| i.unwrap().0.value().to_string())
-                .collect();
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.clear(ALIASES)
     }
 
     pub fn clear_selection_memory(&self) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SELECTION_MEMORY)?;
-            let keys: Vec<String> = table
-                .iter()?
-                .map(|i| i.unwrap().0.value().to_string())
-                .collect();
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.clear(SELECTION_MEMORY)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_alias_and_frecency_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("xerxes-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let db = XerxesDb::new(&dir).unwrap();
+
+        assert_eq!(db.add_directories(&["/a/b", "/a/c"]).unwrap(), 2);
+        assert_eq!(db.add_directories(&["/a/b"]).unwrap(), 0);
+        let dirs = db.get_all_directories().unwrap();
+        let mut paths: Vec<_> = dirs.iter().map(|d| d.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["/a/b", "/a/c"]);
+
+        // Cache must be invalidated by writes.
+        db.remove_directories(&["/a/b"]).unwrap();
+        assert_eq!(db.get_all_directories().unwrap().len(), 1);
+        db.retain_directories(|_, p| p() != Path::new("/a/c"))
+            .unwrap();
+        assert!(db.is_empty().unwrap());
+
+        db.add_alias("proj", Path::new("/a/c")).unwrap();
+        assert_eq!(db.get_alias("proj").unwrap(), Some(PathBuf::from("/a/c")));
+        assert!(db.remove_alias("proj").unwrap());
+        assert!(!db.remove_alias("proj").unwrap());
+
+        db.update_dir_access(Path::new("/a/c")).unwrap();
+        db.update_dir_access(Path::new("/a/c")).unwrap();
+        let f = db.frecencies()[&path_hash(Path::new("/a/c"))];
+        assert!(f > 1.9 && f <= 2.0, "{f}");
+
+        drop(db);
+        let db = XerxesDb::new(&dir).unwrap();
+        assert!(db.frecencies()[&path_hash(Path::new("/a/c"))] > 1.9);
+        std::fs::remove_file(&dir).unwrap();
     }
 }

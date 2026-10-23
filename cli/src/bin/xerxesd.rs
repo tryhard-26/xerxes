@@ -37,13 +37,20 @@ fn index_roots() -> Vec<PathBuf> {
         .map(|d| d.home_dir().to_path_buf())
         .into_iter()
         .chain(std::env::split_paths(&extra).filter(|p| p.is_absolute()))
+        // Resolve symlinked roots: the walker won't descend into them otherwise.
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .collect()
 }
 
 fn index_all(db: &XerxesDb) -> Result<()> {
-    index_roots()
-        .iter()
-        .try_for_each(|root| index::scan_and_index(root, db))
+    index::reindex(&index_roots(), db)
+}
+
+fn status<T>(res: Result<T>, msg: &str) -> Response {
+    match res {
+        Ok(_) => Response::Status(msg.to_string()),
+        Err(e) => Response::Error(e.to_string()),
+    }
 }
 
 fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
@@ -56,53 +63,42 @@ fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
     let response = match request {
         Request::Query(q) => match query::search(&db, &q) {
             Ok(results) => {
-                let paths = results
-                    .into_iter()
-                    .map(|r| (r.path.to_string_lossy().into_owned(), r.score))
-                    .collect();
+                let paths = results.into_iter().map(|r| (r.path, r.score)).collect();
                 Response::QueryResults(paths)
             }
             Err(e) => Response::Error(e.to_string()),
         },
         Request::Select(p) => {
             let path = PathBuf::from(p);
-            match db.update_dir_access(&path) {
-                Ok(_) => Response::Status("Ok".to_string()),
-                Err(e) => Response::Error(e.to_string()),
-            }
+            // Jumps to unindexed dirs (outside roots, hidden, ...) make them searchable.
+            let res = match db.contains(&path) {
+                Ok(true) => Ok(0),
+                _ => db.add_directories(&[&path]),
+            };
+            status(res.and_then(|_| db.update_dir_access(&path)), "Ok")
         }
         Request::AddAlias { nickname, path } => {
-            match db.add_alias(&nickname, &PathBuf::from(path)) {
-                Ok(_) => Response::Status("Alias added".to_string()),
-                Err(e) => Response::Error(e.to_string()),
-            }
+            let msg = format!("Alias added: {} -> {}", nickname, path);
+            status(db.add_alias(&nickname, &PathBuf::from(path)), &msg)
         }
-        Request::RecordSelection { query, path } => {
-            match db.record_selection(&query, &PathBuf::from(path)) {
-                Ok(_) => Response::Status("Selection recorded".to_string()),
-                Err(e) => Response::Error(e.to_string()),
-            }
-        }
+        Request::RecordSelection { query, path } => status(
+            db.record_selection(&query, &PathBuf::from(path)),
+            "Selection recorded",
+        ),
         Request::ListAliases => match db.list_aliases() {
             Ok(aliases) => Response::AliasList(aliases),
             Err(e) => Response::Error(e.to_string()),
         },
         Request::RemoveAlias(nickname) => match db.remove_alias(&nickname) {
-            Ok(_) => Response::Status("Alias removed".to_string()),
+            Ok(true) => Response::Status(format!("Alias removed: {}", nickname)),
+            Ok(false) => Response::Error(format!("No such alias: {}", nickname)),
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::ClearAliases => match db.clear_aliases() {
-            Ok(_) => Response::Status("All aliases cleared".to_string()),
-            Err(e) => Response::Error(e.to_string()),
-        },
-        Request::ClearSelectionMemory => match db.clear_selection_memory() {
-            Ok(_) => Response::Status("Smart learning memory cleared".to_string()),
-            Err(e) => Response::Error(e.to_string()),
-        },
-        Request::Reindex => match index_all(&db) {
-            Ok(_) => Response::Status("Reindex complete".to_string()),
-            Err(e) => Response::Error(e.to_string()),
-        },
+        Request::ClearAliases => status(db.clear_aliases(), "All aliases cleared"),
+        Request::ClearSelectionMemory => {
+            status(db.clear_selection_memory(), "Smart learning memory cleared")
+        }
+        Request::Reindex => status(index_all(&db), "Reindex complete"),
         Request::Stats => match db.get_stats() {
             Ok((dirs, segments)) => Response::Status(format!(
                 "Indexed: {} directories, {} unique segments",
@@ -121,9 +117,11 @@ fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
 
 fn start_watcher(db: Arc<XerxesDb>) {
     thread::spawn(move || {
-        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        use notify::event::ModifyKind;
+        use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
         use std::sync::mpsc::channel;
 
+        let roots = index_roots();
         let (tx, rx) = channel();
         let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
             Ok(w) => w,
@@ -133,26 +131,47 @@ fn start_watcher(db: Arc<XerxesDb>) {
             }
         };
 
-        for root in index_roots() {
+        for root in &roots {
             info!("Starting live filesystem watcher on {:?}", root);
-            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
                 error!("Failed to watch {:?}: {}", root, e);
             }
         }
 
-        for res in rx {
-            match res {
-                Ok(event) => match event.kind {
-                    notify::EventKind::Create(_) => {
-                        for path in event.paths {
-                            if path.is_dir() {
-                                let _ = db.add_directory(&path);
-                            }
-                        }
+        // Drain events in bursts so e.g. a `git clone` costs one transaction, not thousands.
+        while let Ok(first) = rx.recv() {
+            let (mut add, mut remove) = (Vec::new(), Vec::new());
+            for res in std::iter::once(first).chain(rx.try_iter()) {
+                let event: notify::Event = match res {
+                    Ok(event) => event,
+                    Err(e) => {
+                        error!("watch error: {:?}", e);
+                        continue;
                     }
-                    _ => {}
-                },
-                Err(e) => error!("watch error: {:?}", e),
+                };
+                if !matches!(
+                    event.kind,
+                    EventKind::Create(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Modify(ModifyKind::Name(_))
+                ) {
+                    continue;
+                }
+                for path in event.paths {
+                    if path.is_dir() {
+                        if !index::is_ignored(&path, &roots) {
+                            add.push(path);
+                        }
+                    } else {
+                        remove.push(path);
+                    }
+                }
+            }
+            if let Err(e) = db.add_directories(&add) {
+                error!("Failed to index new directories: {}", e);
+            }
+            if let Err(e) = db.remove_directories(&remove) {
+                error!("Failed to drop removed directories: {}", e);
             }
         }
     });
@@ -162,44 +181,37 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!("Starting xerxesd...");
 
+    // Opening the DB first means a second daemon fails on redb's file lock
+    // before it can delete the live daemon's socket.
     let db_path = get_db_path()?;
     let db = Arc::new(XerxesDb::new(&db_path)?);
     info!("Opened DB at {:?}", db_path);
 
-    {
-        let db_clone = Arc::clone(&db);
-        thread::spawn(move || {
-            info!("Pre-warming directory cache...");
-            if let Err(e) = db_clone.get_all_directories() {
-                error!("Failed to pre-warm cache: {}", e);
-            } else {
-                info!("Directory cache warmed.");
-            }
-        });
+    // Bind before the slow work below so clients don't time out waiting.
+    let socket_path = get_socket_path()?;
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
     }
+    let listener = UnixListener::bind(&socket_path)?;
+    info!("Listening on {:?}", socket_path);
 
-    if db.is_empty()? {
-        info!("Database is empty, starting initial reindex...");
-        let db_clone = Arc::clone(&db);
+    {
+        let db = Arc::clone(&db);
         thread::spawn(move || {
-            if let Err(e) = index_all(&db_clone) {
-                error!("Initial reindex failed: {}", e);
+            let res = if db.is_empty().unwrap_or(false) {
+                info!("Database is empty, starting initial reindex...");
+                index_all(&db)
             } else {
-                info!("Initial reindex complete.");
-                let _ = db_clone.get_all_directories();
+                Ok(())
+            };
+            match res.and_then(|_| db.get_all_directories()) {
+                Ok(_) => info!("Directory cache warmed."),
+                Err(e) => error!("Startup indexing failed: {}", e),
             }
         });
     }
 
     start_watcher(Arc::clone(&db));
-
-    let socket_path = get_socket_path()?;
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-    info!("Listening on {:?}", socket_path);
 
     for stream_result in listener.incoming() {
         match stream_result {

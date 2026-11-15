@@ -30,6 +30,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Reindex,
+    Compact,
     Stats,
     Doctor,
     Init {
@@ -87,8 +88,8 @@ fn connect() -> Result<UnixStream> {
 fn send_request(req: Request) -> Result<Response> {
     let mut stream = connect()?;
 
-    // Reindex walks the whole tree; let it take as long as it needs.
-    if !matches!(req, Request::Reindex) {
+    // Reindex and Compact may take longer on large databases; let them take as long as they need.
+    if !matches!(req, Request::Reindex | Request::Compact) {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     }
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -283,6 +284,7 @@ fn main() -> Result<()> {
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::Reindex => print_response(send_request(Request::Reindex)?),
+            Commands::Compact => print_response(send_request(Request::Compact)?),
             Commands::Stats => print_response(send_request(Request::Stats)?),
             Commands::Doctor => print_response(send_request(Request::Doctor)?),
             Commands::Init { shell } => {

@@ -99,6 +99,16 @@ fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
             status(db.clear_selection_memory(), "Smart learning memory cleared")
         }
         Request::Reindex => status(index_all(&db), "Reindex complete"),
+        Request::Compact => {
+            let pruned = db.prune_metadata().unwrap_or(0);
+            match db.compact() {
+                Ok(_) => Response::Status(format!(
+                    "Database compacted successfully (pruned {} stale metadata entries)",
+                    pruned
+                )),
+                Err(e) => Response::Error(format!("Compaction failed: {}", e)),
+            }
+        }
         Request::Stats => match db.get_stats() {
             Ok((dirs, segments)) => Response::Status(format!(
                 "Indexed: {} directories, {} unique segments",
@@ -106,7 +116,17 @@ fn handle_client(mut stream: UnixStream, db: Arc<XerxesDb>) -> Result<()> {
             )),
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Doctor => Response::Status("Doctor says you're fine".to_string()),
+        Request::Doctor => {
+            let _ = db.prune_metadata();
+            let _ = db.compact();
+            match db.get_stats() {
+                Ok((dirs, segments)) => Response::Status(format!(
+                    "Database healthy. Indexed: {} directories, {} unique segments",
+                    dirs, segments
+                )),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
     };
 
     let response_bytes = bincode::serialize(&response)?;
@@ -202,6 +222,8 @@ fn main() -> Result<()> {
                 info!("Database is empty, starting initial reindex...");
                 index_all(&db)
             } else {
+                let _ = db.prune_metadata();
+                let _ = db.compact();
                 Ok(())
             };
             match res.and_then(|_| db.get_all_directories()) {

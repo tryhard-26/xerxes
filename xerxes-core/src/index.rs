@@ -61,16 +61,24 @@ fn scan(root: &Path, db: &XerxesDb, seen: &mut HashSet<u64>) -> Result<()> {
     Ok(())
 }
 
-/// Indexes every root, then drops entries that vanished or are now ignored.
+/// Indexes every root, then drops entries that vanished or are now ignored, and compacts.
 pub fn reindex(roots: &[PathBuf], db: &XerxesDb) -> Result<()> {
     let mut seen = HashSet::new();
     for root in roots {
         scan(root, db, &mut seen)?;
     }
+    // Roots that are missing right now (unplugged drives) keep their entries.
+    let offline: Vec<&PathBuf> = roots.iter().filter(|r| !r.is_dir()).collect();
     // Only entries the walk didn't reach need a stat (e.g. dirs added by jumping to them).
     db.retain_directories(|hash, path| {
-        seen.contains(&hash) || (path().is_dir() && !is_ignored(&path(), roots))
-    })
+        if seen.contains(&hash) {
+            return true;
+        }
+        let path = path();
+        offline.iter().any(|r| path.starts_with(r)) || (path.is_dir() && !is_ignored(&path, roots))
+    })?;
+    let _ = db.compact();
+    Ok(())
 }
 
 #[cfg(test)]

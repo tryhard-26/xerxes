@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 const SEGMENT_ID_TO_STR: TableDefinition<u32, &str> = TableDefinition::new("segment_id_to_str");
 const SEGMENT_STR_TO_ID: TableDefinition<&str, u32> = TableDefinition::new("segment_str_to_id");
@@ -77,7 +77,7 @@ fn now_secs() -> u64 {
 }
 
 pub struct XerxesDb {
-    db: Database,
+    db: RwLock<Database>,
     segments: Mutex<Segments>,
     /// Only directories that have ever been visited; absent means default.
     meta: Mutex<HashMap<u64, DirMetadata>>,
@@ -86,6 +86,14 @@ pub struct XerxesDb {
 }
 
 impl XerxesDb {
+    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        Ok(self.db.read().unwrap().begin_write()?)
+    }
+
+    fn begin_read(&self) -> Result<redb::ReadTransaction> {
+        Ok(self.db.read().unwrap().begin_read()?)
+    }
+
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = Database::create(path)?;
         let mut segments = Segments::default();
@@ -109,19 +117,22 @@ impl XerxesDb {
                 segments.by_id.insert(k.value(), v.value().to_string());
             }
 
-            for item in write_txn.open_table(METADATA)?.iter()? {
-                let (k, v) = item?;
-                if let Ok(m) = bincode::deserialize::<DirMetadata>(v.value()) {
+            // Prune legacy zero-access metadata rows and populate in-memory visited metadata.
+            let mut meta_table = write_txn.open_table(METADATA)?;
+            meta_table.retain(|k, v| {
+                if let Ok(m) = bincode::deserialize::<DirMetadata>(v) {
                     if m.access_count > 0 {
-                        meta.insert(k.value(), m);
+                        meta.insert(k, m);
+                        return true;
                     }
                 }
-            }
+                false
+            })?;
         }
         write_txn.commit()?;
 
         Ok(Self {
-            db,
+            db: RwLock::new(db),
             segments: Mutex::new(segments),
             meta: Mutex::new(meta),
             dir_cache: Mutex::new(None),
@@ -137,7 +148,7 @@ impl XerxesDb {
 
     /// Inserts paths not already indexed, in one transaction. Returns how many were new.
     pub fn add_directories<P: AsRef<Path>>(&self, paths: &[P]) -> Result<usize> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         let mut segs = self.segments.lock().unwrap();
         // New segments live here until commit so a failed txn can't leave dangling ids in memory.
         let mut pending: HashMap<String, u32> = HashMap::new();
@@ -203,7 +214,7 @@ impl XerxesDb {
     }
 
     pub fn contains(&self, path: &Path) -> Result<bool> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         Ok(read_txn
             .open_table(DIRECTORIES)?
             .get(path_hash(path))?
@@ -212,7 +223,7 @@ impl XerxesDb {
 
     /// Removes indexed paths. Returns how many were actually indexed.
     pub fn remove_directories<P: AsRef<Path>>(&self, paths: &[P]) -> Result<usize> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         let mut removed = 0;
         {
             let mut dirs = txn.open_table(DIRECTORIES)?;
@@ -237,10 +248,11 @@ impl XerxesDb {
         &self,
         mut keep: impl FnMut(u64, &dyn Fn() -> PathBuf) -> bool,
     ) -> Result<()> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         {
             let segs = self.segments.lock().unwrap();
-            txn.open_table(DIRECTORIES)?.retain(|hash, v| {
+            let mut dirs = txn.open_table(DIRECTORIES)?;
+            dirs.retain(|hash, v| {
                 let path = || {
                     bincode::deserialize::<DirectoryEntry>(v)
                         .map(|e| segs.resolve(&e.segments))
@@ -248,10 +260,65 @@ impl XerxesDb {
                 };
                 keep(hash, &path)
             })?;
+
+            let mut meta_table = txn.open_table(METADATA)?;
+            meta_table.retain(|hash, v| {
+                dirs.get(hash).map(|d| d.is_some()).unwrap_or(false)
+                    && bincode::deserialize::<DirMetadata>(v)
+                        .map(|m| m.access_count > 0)
+                        .unwrap_or(false)
+            })?;
         }
         txn.commit()?;
+        {
+            let read_txn = self.begin_read()?;
+            let dirs = read_txn.open_table(DIRECTORIES)?;
+            self.meta.lock().unwrap().retain(|hash, _| {
+                dirs.get(*hash).map(|d| d.is_some()).unwrap_or(false)
+            });
+        }
         self.invalidate_cache();
         Ok(())
+    }
+
+    /// Drops metadata for directories that no longer exist or have zero visits.
+    pub fn prune_metadata(&self) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut pruned = 0;
+        {
+            let dirs = txn.open_table(DIRECTORIES)?;
+            let mut meta = txn.open_table(METADATA)?;
+            meta.retain(|hash, v| {
+                let keep = dirs.get(hash).map(|d| d.is_some()).unwrap_or(false)
+                    && bincode::deserialize::<DirMetadata>(v)
+                        .map(|m| m.access_count > 0)
+                        .unwrap_or(false);
+                if !keep {
+                    pruned += 1;
+                }
+                keep
+            })?;
+        }
+        if pruned == 0 {
+            txn.abort()?;
+            return Ok(0);
+        }
+        txn.commit()?;
+        {
+            let read_txn = self.begin_read()?;
+            let dirs = read_txn.open_table(DIRECTORIES)?;
+            self.meta.lock().unwrap().retain(|hash, _| {
+                dirs.get(*hash).map(|d| d.is_some()).unwrap_or(false)
+            });
+        }
+        Ok(pruned)
+    }
+
+    /// Compacts the database file, reclaiming unused pages and shrinking the file on disk.
+    pub fn compact(&self) -> Result<bool> {
+        let mut db = self.db.write().unwrap();
+        let compacted = db.compact()?;
+        Ok(compacted)
     }
 
     pub fn get_all_directories(&self) -> Result<Arc<Vec<CachedDir>>> {
@@ -260,7 +327,7 @@ impl XerxesDb {
         }
 
         let gen = self.cache_gen.load(Ordering::SeqCst);
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         let dirs = read_txn.open_table(DIRECTORIES)?;
 
         let mut entries = Vec::with_capacity(dirs.len()? as usize);
@@ -313,7 +380,7 @@ impl XerxesDb {
         m.access_count += 1;
         let meta_bytes = bincode::serialize(m)?;
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         write_txn
             .open_table(METADATA)?
             .insert(hash, meta_bytes.as_slice())?;
@@ -322,33 +389,33 @@ impl XerxesDb {
     }
 
     pub fn get_stats(&self) -> Result<(u64, usize)> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         let dir_count = read_txn.open_table(DIRECTORIES)?.len()?;
         let segment_count = self.segments.lock().unwrap().by_id.len();
         Ok((dir_count, segment_count))
     }
 
     pub fn is_empty(&self) -> Result<bool> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         Ok(read_txn.open_table(DIRECTORIES)?.is_empty()?)
     }
 
     fn put(&self, table: TableDefinition<&str, &str>, key: &str, value: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         write_txn.open_table(table)?.insert(key, value)?;
         write_txn.commit()?;
         Ok(())
     }
 
     fn get(&self, table: TableDefinition<&str, &str>, key: &str) -> Result<Option<PathBuf>> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         let table = read_txn.open_table(table)?;
         let value = table.get(key)?.map(|v| PathBuf::from(v.value()));
         Ok(value)
     }
 
     fn clear(&self, table: TableDefinition<&str, &str>) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         write_txn.open_table(table)?.retain(|_, _| false)?;
         write_txn.commit()?;
         Ok(())
@@ -371,7 +438,7 @@ impl XerxesDb {
     }
 
     pub fn list_aliases(&self) -> Result<Vec<(String, String)>> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.begin_read()?;
         let table = read_txn.open_table(ALIASES)?;
         let mut results = Vec::new();
         for item in table.iter()? {
@@ -383,7 +450,7 @@ impl XerxesDb {
 
     /// Returns whether the alias existed.
     pub fn remove_alias(&self, nickname: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let existed = write_txn.open_table(ALIASES)?.remove(nickname)?.is_some();
         write_txn.commit()?;
         Ok(existed)
@@ -436,5 +503,24 @@ mod tests {
         let db = XerxesDb::new(&dir).unwrap();
         assert!(db.frecencies()[&path_hash(Path::new("/a/c"))] > 1.9);
         std::fs::remove_file(&dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_pruning_and_compaction() {
+        let dir = std::env::temp_dir().join(format!("xerxes-compact-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let db = XerxesDb::new(&dir).unwrap();
+
+        db.add_directories(&["/x/1", "/x/2"]).unwrap();
+        db.update_dir_access(Path::new("/x/1")).unwrap();
+        assert_eq!(db.frecencies().len(), 1);
+
+        // Retaining only /x/2 should prune /x/1 from directories and metadata
+        db.retain_directories(|_, p| p() == Path::new("/x/2")).unwrap();
+        assert_eq!(db.frecencies().len(), 0);
+
+        assert!(db.compact().is_ok());
+        drop(db);
+        let _ = std::fs::remove_file(&dir);
     }
 }

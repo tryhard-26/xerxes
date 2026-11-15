@@ -11,6 +11,7 @@ pub enum Request {
     ClearAliases,
     ClearSelectionMemory,
     Reindex,
+    Compact,
     Stats,
     Doctor,
 }

@@ -56,27 +56,19 @@ pub fn search(db: &XerxesDb, query: &str) -> Result<Vec<SearchResult>> {
         })
         .collect();
 
-    let by_score = |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0);
-    if scored.len() > MAX_RESULTS {
-        scored.select_nth_unstable_by(MAX_RESULTS, by_score);
-        scored.truncate(MAX_RESULTS);
-    }
-    scored.sort_unstable_by(by_score);
-
-    Ok(scored
-        .into_iter()
-        .map(|(score, i)| SearchResult {
-            path: dirs[i].path.clone(),
-            score,
-        })
-        // The index can lag behind deletions the watcher missed.
-        .filter(|r| Path::new(&r.path).is_dir())
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    // Full sort (cheap on (f32, usize) pairs) so missing dirs can be skipped
+    // while still filling MAX_RESULTS.
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
     // Hide missing dirs (deleted, or on an unplugged drive) but keep them indexed.
-    Ok(results
+    Ok(scored
         .into_iter()
-        .filter(|r| r.path.is_dir())
-        .take(20)
+        .map(|(score, i)| (score, &dirs[i].path))
+        .filter(|(_, path)| Path::new(path).is_dir())
+        .take(MAX_RESULTS)
+        .map(|(score, path)| SearchResult {
+            path: path.clone(),
+            score,
+        })
         .collect())
 }

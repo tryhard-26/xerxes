@@ -76,7 +76,7 @@ fn connect() -> Result<UnixStream> {
         .spawn()
         .context("Failed to spawn _xerxesd. Is it installed in the same directory?")?;
 
-    for _ in 0..40 {
+    for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if let Ok(stream) = UnixStream::connect(&socket_path) {
             return Ok(stream);
